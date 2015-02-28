@@ -1,0 +1,119 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Compress::Raw::Zlib qw/WANT_GZIP Z_STREAM_END/;
+
+socket my $sock, 2, 1, 0;
+
+# Make the socket unbuffered.
+binmode $sock, ':unix';
+
+my $host = gethostbyname 'www.cpan.org'
+    or die "Failed to resolve www.cpan.org\n";
+
+connect $sock, pack 'Sna4x8', 2, 80, $host or die "$!\n";
+
+print $sock <<'HTTP';
+GET /modules/02packages.details.txt.gz HTTP/1.0
+Host:www.cpan.org
+
+HTTP
+
+my @lens = map length, my @headers = qw/Package Current Latest/;
+
+my ( %files, @lines, %seen );
+
+# FIXME Skip ., be more thorough.
+# Finds every .pm currently in @INC.
+for (@INC) {
+    my $len = 1 + length;
+
+    my $path = "$_/*";
+
+    while ( my @files = <$path.pm> ) {
+        $files{ substr( $_, $len, -3 ) =~ s|/|::|gr } ||= $_ for @files;
+
+        $path .= '/*';
+    }
+}
+
+# $SVN::Core::VERSION is built from the export of SVN::Base, I don't see a
+# sane way of getting that without compiling the code.
+delete $files{'SVN::Core'};
+
+# Skip past the HTTP header.
+while ( <$sock> ne "\r\n" ) {}
+
+my $status = Compress::Raw::Zlib::Inflate
+    ->new( -WindowBits => WANT_GZIP )
+    ->inflate( do { local $/; <$sock> }, my $packages );
+
+die $status if $status != Z_STREAM_END;
+
+# Skip header.
+substr $packages, 0, 2 + index( $packages, "\n\n" ), '';
+
+# Read a line at a time from $packages until that line is false.
+while ( $_ = substr $packages, 0, 1 + index( $packages, "\n" ), '' ) {
+    # Optimisation, find the package name quickly, and test if we have it.
+    next unless exists $files{ substr $_, 0, index $_, ' ' };
+
+    # This line also grabs the package, but it's slower as it uses a regex.
+    my ( $pkg, $latest, $dist ) = split ' ';
+
+    next if $latest eq 'undef' || exists $seen{$dist};
+
+    my ( $current, $fh, $has_ver );
+
+    open $fh, '<', $files{$pkg};
+
+    # Test for package NAME VER format, but only on the first line for now.
+    if ( <$fh> =~ /^package $pkg ([^;]+)/ ) {
+        $current = eval $1;
+    }
+    else {
+        while (<$fh>) {
+            # Skip comments & POD. The first test in really cheap and avoids
+            # using a regex to detect a comment far left aligned.
+            next if '#' eq substr $_, 0, 1
+                 or /^\s+#/
+                 or /^=head1/ .. /^=cut/;
+
+            $has_ver ||= -1 != index $_, 'VERSION';
+
+            next unless /\$[\w:]*\bVERSION\b.*=/;
+
+            ( $current = eval "package v;no strict;$_" ) =~ s/\s+$//;
+
+            warn $@ if $@;
+
+            last;
+        }
+    }
+
+    warn "Failed to parse version in $files{$pkg}\n" if $has_ver && !$current;
+
+    next if !$current || version->new($current) >= version->new($latest);
+
+    push @lines, [ $pkg, $current, $latest ];
+
+    $lens[0] = $_ if $lens[0] < ( $_ = length $pkg );
+    $lens[1] = $_ if $lens[1] < ( $_ = length $current );
+    $lens[2] = $_ if $lens[2] < ( $_ = length $latest );
+
+    $seen{$dist} = undef;
+}
+
+# TODO Detect if we have our output piped, e.g. "cpanold | cpanm",
+# and if so, just print out the list of packages.
+if (@lines) {
+    my $format = join( ' ', map "\%${_}s", @lens ) . "\n";
+
+    printf $format, @headers;
+
+    print '-' x ( 2 + $lens[0] + $lens[1] + $lens[2] ), "\n";
+
+    printf $format, @$_ for @lines;
+}
